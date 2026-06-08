@@ -1,0 +1,332 @@
+syntax = "proto3";
+
+package capri.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// ===========================================================================
+// StockIntel Trading API — Protocol Buffers Schema
+// ===========================================================================
+//
+// Public endpoint: wss://trading.stockintel.com/ws/v1
+//
+// Every binary WebSocket frame carries exactly one ClientFrame (client→server)
+// or ServerFrame (server→client).  Authentication is via a Bearer token in the
+// HTTP Authorization header of the WebSocket upgrade request.
+//
+// See docs/public/ for the full API reference and getting-started guide.
+
+// ===========================================================================
+// Envelopes
+// ===========================================================================
+
+// Client → server.  request_id is a client-generated UUID string, never reused
+// on a connection; the server echoes it on the matching result or Error.
+message ClientFrame {
+  string request_id = 1;
+
+  oneof command {
+    PlaceOrderRequest       place_order        = 10;
+    CancelOrderRequest      cancel_order       = 11;
+    ListOrdersRequest       list_orders        = 12;
+    ListAccountsRequest     list_accounts      = 13;
+    GetAccountRequest       get_account        = 14;
+    GetSessionStatusRequest get_session_status = 15;
+  }
+  reserved 30;
+}
+
+// Server → client.  For a command result, request_id mirrors the ClientFrame
+// it answers.  For server pushes (Welcome, ExecutionEvent, TradingSessionStatus)
+// request_id is empty ("").
+message ServerFrame {
+  string request_id = 1;
+
+  oneof payload {
+    Welcome                  welcome             = 2;
+    PlaceOrderResponse       place_order         = 10;
+    CancelOrderResponse      cancel_order        = 11;
+    ListOrdersResponse       list_orders         = 12;
+    ListAccountsResponse     list_accounts       = 13;
+    GetAccountResponse       get_account         = 14;
+    GetSessionStatusResponse get_session_status  = 15;
+    ExecutionEvent           execution_event     = 20;
+    TradingSessionStatus     session_status      = 21;
+    Error                    error               = 30;
+  }
+  reserved 31;
+}
+
+// Pushed immediately after a successful upgrade.
+message Welcome {
+  string environment = 1;             // "sandbox" | "live"
+  repeated AccountMeta accounts = 2;
+  uint32 heartbeat_interval_ms = 3;
+  string server_version = 4;
+}
+
+message Error {
+  ErrorCode code = 1;
+  string message = 2;                 // safe, human-readable
+  string reason = 3;                  // machine-readable upstream/internal reason
+  RetryInfo retry_info = 4;           // present on RATE_LIMITED
+}
+
+message RetryInfo {
+  uint32 retry_after_ms = 1;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_INVALID_REQUEST = 1;       // malformed / validation / upstream rejection
+  ERROR_CODE_UNAUTHENTICATED = 2;       // token revoked or expired mid-connection (reserved)
+  ERROR_CODE_PERMISSION_DENIED = 3;     // account not owned, inactive for trading, env mismatch
+  ERROR_CODE_RATE_LIMITED = 6;          // order rate (5/sec) exceeded, or duplicate read in flight
+  ERROR_CODE_UPSTREAM_UNAVAILABLE = 7;  // trading system down, or request timed out
+  ERROR_CODE_INTERNAL = 9;              // unexpected server error
+  ERROR_CODE_PIN_NOT_SETUP = 10;        // account has no PIN configured
+  ERROR_CODE_INVALID_PIN = 11;          // supplied PIN missing or does not match
+}
+
+// ===========================================================================
+// Enums
+// ===========================================================================
+
+enum Market {
+  MARKET_UNSPECIFIED = 0;
+  MARKET_REG = 1;  // Regular
+  MARKET_BNB = 2;  // Bills and Bonds
+  MARKET_FUT = 3;  // Futures
+  MARKET_ODL = 4;  // Odd Lot
+  MARKET_SQR = 5;  // Square-up
+  MARKET_FSR = 6;  // Futures Square-up
+  MARKET_NDM = 7;  // Negotiated Deal Market
+  MARKET_SIF = 8;  // Stock Index Futures
+  MARKET_IOM = 9;  // Index Options Market
+  MARKET_SOM = 10; // Stock Options Market
+}
+
+enum OrderType {
+  ORDER_TYPE_UNSPECIFIED = 0;
+  ORDER_TYPE_MARKET = 1;
+  ORDER_TYPE_LIMIT = 2;
+  ORDER_TYPE_MARKET_TO_LIMIT = 3;
+  ORDER_TYPE_STOP_LOSS = 4;
+}
+
+enum OrderSide {
+  ORDER_SIDE_UNSPECIFIED = 0;
+  ORDER_SIDE_BUY = 1;
+  ORDER_SIDE_SELL = 2;
+  ORDER_SIDE_BORROW = 3;
+  ORDER_SIDE_SHORT_SELL = 4;
+}
+
+enum TimeInForce {
+  TIME_IN_FORCE_UNSPECIFIED = 0;
+  TIME_IN_FORCE_DAY = 1;
+  TIME_IN_FORCE_IOC = 2;
+  TIME_IN_FORCE_FOK = 3;
+  TIME_IN_FORCE_GTC = 4;
+}
+
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_SUBMITTED = 1;
+  ORDER_STATUS_RECEIVED = 2;
+  ORDER_STATUS_QUEUED = 3;
+  ORDER_STATUS_PARTIAL = 4;
+  ORDER_STATUS_FILLED = 5;
+  ORDER_STATUS_ERROR = 6;
+  ORDER_STATUS_CANCELLED = 7;
+  ORDER_STATUS_REJECTED = 8;
+}
+
+enum SessionStatus {
+  SESSION_STATUS_UNSPECIFIED = 0;
+  SESSION_STATUS_OPEN = 1;
+  SESSION_STATUS_PRE_MARKET = 2;
+  SESSION_STATUS_SUSPENDED = 3;
+  SESSION_STATUS_PRE_CLOSE = 4;
+  SESSION_STATUS_ON_HOLD = 5;
+  SESSION_STATUS_BREAK = 6;
+  SESSION_STATUS_READY = 7;
+  SESSION_STATUS_NA = 8;
+}
+
+enum AccountStatus {
+  ACCOUNT_STATUS_UNSPECIFIED = 0;
+  ACCOUNT_STATUS_INACTIVE = 1;
+  ACCOUNT_STATUS_ACTIVE = 2;
+}
+
+// ===========================================================================
+// Orders
+// ===========================================================================
+
+message PlaceOrderRequest {
+  string broker_code = 1;
+  string client_code = 2;
+  Market market = 3;
+  string symbol = 4;
+  OrderType type = 5;
+  OrderSide side = 6;
+  double quantity = 7;
+  double price = 8;
+  double stop_price = 9;
+  TimeInForce time_in_force = 10;
+  string pin = 11;
+}
+
+message PlaceOrderResponse {}
+
+message CancelOrderRequest {
+  string broker_code = 1;
+  string client_code = 2;
+  string broker_order_id = 3;
+  string exchange_order_id = 4;
+  string pin = 5;
+}
+
+message CancelOrderResponse {}
+
+message ListOrdersRequest {
+  string broker_code = 1;
+  string client_code = 2;
+  OrderStatus status = 3;
+  string symbol = 4;
+  Market market = 5;
+  OrderSide side = 6;
+  OrderType type = 7;
+  string date_from = 8;
+  string date_to = 9;
+  int32 offset = 10;
+  int32 count = 11;
+}
+
+message ListOrdersResponse {
+  int32 offset = 1;
+  int32 count = 2;
+  int32 total = 3;
+  repeated Order orders = 4;
+}
+
+message Order {
+  string id = 1;
+  string broker_code = 2;
+  string client_code = 3;
+  Market market = 4;
+  string symbol = 5;
+  OrderType type = 6;
+  OrderSide side = 7;
+  OrderStatus status = 8;
+  double price = 9;
+  double stop_price = 10;
+  double quantity = 11;
+  TimeInForce time_in_force = 12;
+  string broker_order_id = 13;
+  string exchange_order_id = 14;
+  repeated OrderFill fills = 15;
+  reserved 16;
+  google.protobuf.Timestamp created_at = 17;
+  google.protobuf.Timestamp updated_at = 18;
+}
+
+message OrderFill {
+  double price = 1;
+  double quantity = 2;
+}
+
+message ExecutionEvent {
+  OrderExecution execution = 1;
+  reserved 2;
+}
+
+message OrderExecution {
+  string broker_code = 1;
+  string client_code = 2;
+  OrderStatus status = 3;
+  string symbol = 4;
+  Market market = 5;
+  OrderType type = 6;
+  OrderSide side = 7;
+  TimeInForce time_in_force = 8;
+  string broker_order_id = 9;
+  string exchange_order_id = 10;
+  string broker_orig_order_id = 11;
+  double price = 12;
+  double quantity = 13;
+  double last_price = 14;
+  double last_quantity = 15;
+  double quantity_remaining = 16;
+  double quantity_executed = 17;
+  string message = 18;
+  reserved 19, 20;
+  google.protobuf.Timestamp timestamp = 21;
+}
+
+// ===========================================================================
+// Accounts
+// ===========================================================================
+
+message ListAccountsRequest {}
+
+message ListAccountsResponse {
+  string environment = 1;
+  repeated AccountMeta accounts = 2;
+}
+
+message AccountMeta {
+  string broker_code = 1;
+  string client_code = 2;
+  AccountStatus status = 3;
+}
+
+message GetAccountRequest {
+  string broker_code = 1;
+  string client_code = 2;
+}
+
+message GetAccountResponse {
+  string broker_code = 1;
+  string client_code = 2;
+  double value = 3;
+  double market_value = 4;
+  double balance = 5;
+  double buying_power = 6;
+  repeated Position positions = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp last_updated = 9;
+}
+
+message Position {
+  string symbol = 1;
+  Market market = 2;
+  int64 quantity = 3;
+  double market_price = 4;
+  double market_value = 5;
+  double avg_price = 6;
+  double avg_value = 7;
+  double haircut = 8;
+  double haircut_value = 9;
+}
+
+// ===========================================================================
+// Trading sessions
+// ===========================================================================
+
+message GetSessionStatusRequest {
+  string broker_code = 1;
+  Market market = 2;
+}
+
+message GetSessionStatusResponse {
+  TradingSessionStatus status = 1;
+}
+
+message TradingSessionStatus {
+  string broker_code = 1;
+  Market market = 2;
+  SessionStatus status = 3;
+  google.protobuf.Timestamp timestamp = 4;
+}
