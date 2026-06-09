@@ -216,6 +216,13 @@ You can now send commands: place orders, cancel orders, fetch account balances, 
 
 ## 6. Sandbox Testing
 
+> **Sandbox account:** When you connect with a sandbox token, your session includes a pre-configured synthetic trading account:
+> - `broker_code`: `"sandbox"`
+> - `client_code`: `"CS01"`
+> - PIN: `"1234"`
+>
+> No account setup is needed — use these values directly in `PlaceOrder`, `CancelOrder`, and any other account-scoped commands.
+
 The sandbox broker provides **deterministic order outcomes** based on the `quantity` you submit:
 
 | Quantity | Outcome |

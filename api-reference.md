@@ -176,9 +176,16 @@ Retrieve paginated order history and status.
 | `time_in_force` | `TimeInForce` enum | |
 | `broker_order_id` | string | Broker order ID (FIX tag 11) |
 | `exchange_order_id` | string | Exchange order ID (FIX tag 37) |
-| `fills` | repeated `OrderFill` | Individual fills ({price, quantity}) |
+| `fills` | repeated `OrderFill` | Individual fills |
 | `created_at` | `google.protobuf.Timestamp` | |
 | `updated_at` | `google.protobuf.Timestamp` | |
+
+**`OrderFill`**
+
+| Field | Type | Notes |
+|---|---|---|
+| `price` | double | Fill price |
+| `quantity` | double | Fill quantity |
 
 ---
 
@@ -207,7 +214,7 @@ Returns trading accounts linked to your token — directly from the verified ses
 
 ### `GetAccount`
 
-Fetch the account snapshot: value, balance, buying power, and positions. Served from cache; timestamps let you judge freshness.
+Fetch the account snapshot: value, balance, buying power, and positions. Served from a cache that refreshes automatically in the background when data is older than 5 minutes. Use `created_at` and `last_updated` to determine data age.
 
 **Request: `GetAccountRequest`**
 
@@ -311,7 +318,7 @@ Pushed **automatically** for every order execution update your accounts are enti
 | `time_in_force` | `TimeInForce` enum | |
 | `broker_order_id` | string | Broker order ID (FIX tag 11) |
 | `exchange_order_id` | string | Exchange order ID (FIX tag 37) |
-| `broker_orig_order_id` | string | Original order ID on cancellations (FIX tag 41) |
+| `broker_orig_order_id` | string | Set only on cancellation executions; references the cancelled order's `broker_order_id` (FIX tag 41) |
 | `price` | double | Order limit price |
 | `quantity` | double | Original order quantity |
 | `last_price` | double | Last fill price |
@@ -397,6 +404,18 @@ Pushed **automatically** when a market's trading session status changes. You onl
 | `ORDER_STATUS_CANCELLED` (7) | Cancelled |
 | `ORDER_STATUS_REJECTED` (8) | Rejected by broker/exchange |
 
+**Normal lifecycle:**
+
+```
+SUBMITTED → RECEIVED → QUEUED → FILLED
+                              ↘ PARTIAL → FILLED
+                              ↘ CANCELLED
+                              ↘ REJECTED
+                              ↘ ERROR
+```
+
+Any non-terminal status may transition to `CANCELLED` when a cancel request is accepted by the broker.
+
 **Terminal states:** `FILLED` (5), `ERROR` (6), `CANCELLED` (7), `REJECTED` (8). Once an order reaches one of these, no further updates are sent.
 
 ### `SessionStatus`
@@ -410,7 +429,7 @@ Pushed **automatically** when a market's trading session status changes. You onl
 | `SESSION_STATUS_ON_HOLD` (5) | On hold |
 | `SESSION_STATUS_BREAK` (6) | Break |
 | `SESSION_STATUS_READY` (7) | Ready |
-| `SESSION_STATUS_NA` (8) | Not available / unknown |
+| `SESSION_STATUS_NA` (8) | Not available — the broker has not yet reported a session state |
 
 ### `AccountStatus`
 
@@ -440,10 +459,12 @@ Errors arrive as a `ServerFrame` with the `error` payload, carrying the command'
 | `ERROR_CODE_UNAUTHENTICATED` | 2 | Mid-connection deauthorization (reserved) | No |
 | `ERROR_CODE_PERMISSION_DENIED` | 3 | Account not owned, inactive for trading, or environment mismatch | No |
 | `ERROR_CODE_RATE_LIMITED` | 6 | Order rate (5/sec) exceeded, or duplicate read in-flight | Yes (honor `retry_after_ms`) |
-| `ERROR_CODE_UPSTREAM_UNAVAILABLE` | 7 | Trading system down or request timed out | Yes (backoff) |
+| `ERROR_CODE_UPSTREAM_UNAVAILABLE` | 7 | Trading system down or read request timed out | Yes (backoff) |
 | `ERROR_CODE_INTERNAL` | 9 | Unexpected server error | No |
 | `ERROR_CODE_PIN_NOT_SETUP` | 10 | Account has no PIN configured; cannot place/cancel orders | No (set up PIN) |
 | `ERROR_CODE_INVALID_PIN` | 11 | Supplied PIN missing or doesn't match account PIN | No (supply correct PIN) |
+
+> **Note:** `UPSTREAM_UNAVAILABLE` is only returned for read commands (`ListOrders`, `GetAccount`, `GetSessionStatus`). `PlaceOrder` and `CancelOrder` do not time out server-side — the server holds them open until the broker responds. Design your client-side timeout logic accordingly: it is not safe to blindly retry an order command without first checking whether the original was accepted.
 
 ### `RetryInfo`
 
@@ -522,6 +543,19 @@ The server validates all commands before forwarding upstream. Failures return `E
 4. **Tolerate early executions** — an `ExecutionEvent` tagged with your `request_id` may arrive before the `PlaceOrderResponse` ack.
 5. **Track order lifecycle on the stream** — don't rely on command responses for order outcomes.
 6. **Correlate external executions** — executions for orders placed outside your connection carry empty `request_id`; use `broker_order_id` / `exchange_order_id`.
-7. **Reconnect with backoff** — on socket drop, reconnect with exponential backoff and resync via `ListOrders`.
+7. **Reconnect with backoff** — on socket drop, reconnect with exponential backoff and resync via `ListOrders`. Execution events restart after reconnect but events missed during the gap are not replayed; reconcile open orders by diffing `ListOrders` against your locally tracked state.
 8. **Do not auto-reconnect on `4002`** — `SESSION_SUPERSEDED` means another connection took over. Fix the duplicate.
 9. **Honor `retry_after_ms`** — on `RATE_LIMITED`, wait before retrying.
+
+---
+
+## Versioning
+
+This API is `v1`. Backward compatibility is maintained within v1 via additive-only changes:
+
+- New **fields** may be added to any message. Ignore unknown fields rather than treating them as errors.
+- New **enum values** may be added. Treat unknown enum values as `0` / `*_UNSPECIFIED` rather than failing.
+- Existing field numbers and enum values are never removed or renumbered within v1.
+- **Breaking changes** (removed fields, type changes, semantic changes) require a new major version (`v2`) introduced side-by-side.
+
+**Reserved field range:** Field numbers 40–49 in `ClientFrame` and `ServerFrame` are reserved for a future market data extension (quotes, order book). Do not use these field numbers in any custom proto extensions.
