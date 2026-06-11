@@ -92,6 +92,16 @@ Sec-WebSocket-Protocol: capri.v1
 
 ---
 
+## Reference Client
+
+A Python terminal client is available for developers to explore and test the API interactively:
+
+**[stockintel-trading-client](https://github.com/capitalstake/stockintel-trading-client)** — a Textual TUI that connects over WebSocket + Protobuf and exposes all API commands (place/cancel orders, list accounts, get positions, session status, OTP verification) via keyboard shortcuts. Intended as a developer testing view, not a production application.
+
+Use it to observe real protocol frames, test sandbox order outcomes, and verify your token and account setup before building your own client.
+
+---
+
 ## Language Support
 
 Protocol Buffers gives you generated, type-safe clients in Python, JavaScript/TypeScript, Go, Java, C++, C#, Rust, and more. See the [Protobuf Guide](./protobuf.md) for compilation instructions and minimal client examples.
