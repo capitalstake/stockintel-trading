@@ -205,9 +205,21 @@ ws.on('message', (data) => {
 
 ## 5. What Happens After Connect
 
-Immediately after the WebSocket upgrade succeeds, the server pushes two things:
+Immediately after the WebSocket upgrade succeeds, the server pushes a **`Welcome` frame** telling you your environment (`"sandbox"` or `"live"`), the server's heartbeat interval, and your linked trading accounts.
 
-1. **A `Welcome` frame** — tells you your environment (`"sandbox"` or `"live"`), lists every trading account linked to your token (with broker/client codes and active/inactive status), and the server's heartbeat interval.
+**If you connected with a live token and OTP is required:**
+
+- `Welcome.otp_required` is `true` and `Welcome.accounts` is empty.
+- If `Welcome.has_email` is `true`, the server emailed you a 5-digit code. Send it back with `SubmitOtp` before any trading commands.
+- If `Welcome.has_email` is `false`, no email is configured for your account. Add an email in your **StockIntel settings**, then reconnect.
+- All trading/account commands return `ERROR_CODE_OTP_REQUIRED` until OTP succeeds.
+- After successful `SubmitOtp`, the server replies with `SubmitOtpResponse` carrying your unlocked accounts.
+
+**Sandbox tokens are never OTP-gated** — `Welcome.otp_required` is always `false`, accounts are populated immediately, and you can start sending commands right away.
+
+Once the session is unlocked (or OTP is not required):
+
+1. **Accounts are available** — listed in `Welcome.accounts` or `SubmitOtpResponse.accounts`.
 2. **Real-time data begins** — `ExecutionEvent` and `TradingSessionStatus` frames start arriving automatically. No subscribe step required.
 
 You can now send commands: place orders, cancel orders, fetch account balances, query order history, or check market session status. See the [API Reference](./api-reference.md) for the full operation catalog.
@@ -240,22 +252,41 @@ Use these scenarios to test your order lifecycle handling, error recovery, and c
 
 ## 7. Connection Lifecycle
 
+**Sandbox / live token within OTP window:**
+
 ```
   Client                         StockIntel API
     │                                    │
     │── WSS Upgrade + Auth ─────────────▶│
-    │◀──────── 101 + Welcome ────────────│  (real-time pushes start)
+    │◀──────── 101 + Welcome ────────────│  (otp_required:false; real-time pushes start)
     │                                    │
     │── ClientFrame { PlaceOrder } ─────▶│
     │◀── ServerFrame { PlaceOrder {} } ──│  (immediate empty ack)
-    │◀── ServerFrame { ExecutionEvent } ─│  (status: SUBMITTED)
-    │◀── ServerFrame { ExecutionEvent } ─│  (status: QUEUED)
-    │◀── ServerFrame { ExecutionEvent } ─│  (status: FILLED)
+    │◀── ServerFrame { ExecutionEvent } ─│  (status: SUBMITTED → QUEUED → FILLED)
     │                                    │
     │── ClientFrame { GetAccount } ─────▶│
     │◀── ServerFrame { GetAccount } ─────│
     │                                    │
     │── close ──────────────────────────▶│ (or keepalive ping/pong)
+```
+
+**Live token outside OTP window (first connect or 7-day window expired):**
+
+```
+  Client                         StockIntel API
+    │                                    │
+    │── WSS Upgrade + Auth ─────────────▶│
+    │◀──────── 101 + Welcome ────────────│  (otp_required:true, accounts:[], otp_message)
+    │                                    │
+    │   [user checks email for code]     │
+    │── ClientFrame { SubmitOtp } ──────▶│
+    │◀── ServerFrame { SubmitOtpResponse }│  (accounts now populated)
+    │                                    │   (real-time pushes start after unlock)
+    │── ClientFrame { PlaceOrder } ─────▶│
+    │◀── ServerFrame { PlaceOrder {} } ──│  (immediate empty ack)
+    │◀── ServerFrame { ExecutionEvent } ─│  (status: SUBMITTED → QUEUED → FILLED)
+    │                                    │
+    │── close ──────────────────────────▶│
 ```
 
 - **Keepalive:** The server sends native WebSocket pings every 30 seconds. Your WebSocket library should respond with pongs automatically.

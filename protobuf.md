@@ -13,7 +13,7 @@ The API defines two top-level envelope messages:
 
 All frames are **binary** WebSocket messages (opcode 0x2). Text frames are rejected. Each frame contains exactly one serialized `ClientFrame` or `ServerFrame`.
 
-The schema also defines all request/response messages, enums (market, order type, order side, time-in-force, order status, session status, error codes), and the `google.protobuf.Timestamp` import for timestamps.
+The schema also defines all request/response messages, enums (market, order type, order side, time-in-force, order status, session status, error codes), and the `google.protobuf.Timestamp` import for timestamps. For live tokens, the protocol includes an OTP gate — see [Handling OTP (live tokens)](#handling-otp-live-tokens) below.
 
 ---
 
@@ -428,8 +428,80 @@ The `.proto` file is standard proto3 and compiles with `protoc` for any supporte
 
 4. **Duplicate reads** — Sending a read command identical to one already awaiting its result (same `oneof` type with same field values, excluding `request_id`) is rejected with `RATE_LIMITED` (`reason = "duplicate_in_flight"`). Wait for the first result before retrying.
 
-5. **Welcome frame** — The first message after a successful connect is always a `ServerFrame` with the `welcome` payload. Your client must read it before sending commands. It arrives immediately; you won't miss it.
+5. **Welcome frame** — The first message after a successful connect is always a `ServerFrame` with the `welcome` payload. Your client must read it before sending commands. It arrives immediately; you won't miss it. For live tokens, check `welcome.otp_required` — if `true`, complete `SubmitOtp` before sending any other commands (see [Handling OTP](#handling-otp-live-tokens)).
 
 6. **Execution ordering** — An `ExecutionEvent` for your order may arrive **before** the `PlaceOrderResponse` acknowledgement. Always be ready to receive executions tagged with a `request_id` you just sent, even before the ack.
 
 7. **Keepalive** — The server sends native WebSocket pings. Your library should handle pong responses automatically. Do not implement application-level ping/pong — the `Ping`/`Pong` messages in the proto are reserved and not used.
+
+---
+
+## Handling OTP (live tokens)
+
+Live tokens may require a one-time email code before trading commands are allowed. This section shows the pattern in Python; the same logic applies in any language.
+
+**After connecting, always check `Welcome.otp_required`:**
+
+```python
+async def connect_with_otp(token, get_code_fn):
+    """Connect and complete OTP if required. get_code_fn() prompts for the code."""
+    ws = await websockets.connect(
+        URL,
+        extra_headers={
+            "Authorization": f"Bearer {token}",
+            "Sec-WebSocket-Protocol": "capri.v1",
+        },
+        ping_interval=None,
+    )
+
+    # Read Welcome
+    data = await ws.recv()
+    frame = capri_pb2.ServerFrame()
+    frame.ParseFromString(data)
+    welcome = frame.welcome
+
+    print(f"Connected: env={welcome.environment}")
+
+    if welcome.otp_required:
+        if not welcome.has_email:
+            # No email on file — cannot receive a code.
+            print(welcome.otp_message)  # tells user to add email in StockIntel settings
+            await ws.close()
+            raise RuntimeError("OTP required but no email configured")
+
+        # OTP code was emailed — prompt the user (or read from stdin/config).
+        print(welcome.otp_message)  # "A one-time code has been sent to your email..."
+        code = get_code_fn()        # e.g. input("Enter code: ")
+
+        # Submit the code.
+        cmd = capri_pb2.ClientFrame()
+        cmd.request_id = str(uuid.uuid4())
+        cmd.submit_otp.code = code
+        await ws.send(cmd.SerializeToString())
+
+        # Read the response.
+        data = await ws.recv()
+        resp_frame = capri_pb2.ServerFrame()
+        resp_frame.ParseFromString(data)
+
+        if resp_frame.HasField("error"):
+            err = resp_frame.error
+            if err.code == capri_pb2.ERROR_CODE_INVALID_OTP:
+                raise RuntimeError("Invalid or expired OTP code. Try again.")
+            raise RuntimeError(f"OTP error: {err.message}")
+
+        otp_resp = resp_frame.submit_otp
+        print(f"OTP verified. Accounts: {[a.client_code for a in otp_resp.accounts]}")
+        return ws, otp_resp.accounts
+
+    else:
+        # No OTP needed — accounts are in Welcome directly.
+        return ws, list(welcome.accounts)
+```
+
+**Key points:**
+- `otp_required: false` — accounts are in `Welcome.accounts`; proceed normally.
+- `otp_required: true, has_email: true` — display `Welcome.otp_message`, collect the code, send `SubmitOtp`.
+- `otp_required: true, has_email: false` — display `Welcome.otp_message` (directs user to add email in StockIntel settings), then close the connection; there is no way to complete OTP in this session.
+- After successful `SubmitOtp`, accounts are in `SubmitOtpResponse.accounts`; the session is unlocked and cached for future reconnects within the 7-day window.
+- **Sandbox tokens never require OTP.** `otp_required` is always `false` for `si_sb_...` tokens.

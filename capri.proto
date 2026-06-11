@@ -32,6 +32,7 @@ message ClientFrame {
     ListAccountsRequest     list_accounts      = 13;
     GetAccountRequest       get_account        = 14;
     GetSessionStatusRequest get_session_status = 15;
+    SubmitOtpRequest        submit_otp         = 16;
   }
   reserved 30;
 }
@@ -50,6 +51,7 @@ message ServerFrame {
     ListAccountsResponse     list_accounts       = 13;
     GetAccountResponse       get_account         = 14;
     GetSessionStatusResponse get_session_status  = 15;
+    SubmitOtpResponse        submit_otp          = 16;
     ExecutionEvent           execution_event     = 20;
     TradingSessionStatus     session_status      = 21;
     Error                    error               = 30;
@@ -58,11 +60,16 @@ message ServerFrame {
 }
 
 // Pushed immediately after a successful upgrade.
+// For live tokens that require OTP, otp_required is true and accounts is empty.
+// Submit a SubmitOtpRequest to unlock accounts before sending trading commands.
 message Welcome {
   string environment = 1;             // "sandbox" | "live"
-  repeated AccountMeta accounts = 2;
+  repeated AccountMeta accounts = 2;  // empty when otp_required is true
   uint32 heartbeat_interval_ms = 3;
   string server_version = 4;
+  bool otp_required = 5;              // true: live token must complete OTP before trading
+  bool has_email = 6;                 // true: OTP code was emailed; false: add email in settings
+  string otp_message = 7;             // human-readable instruction (non-empty when otp_required)
 }
 
 message Error {
@@ -76,6 +83,16 @@ message RetryInfo {
   uint32 retry_after_ms = 1;
 }
 
+// OTP verification messages (live tokens only; sandbox is never gated).
+message SubmitOtpRequest {
+  string code = 1;                    // 5-digit code from email; token is implicit to the connection
+}
+
+message SubmitOtpResponse {
+  string environment = 1;
+  repeated AccountMeta accounts = 2;  // the now-unlocked accounts
+}
+
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   ERROR_CODE_INVALID_REQUEST = 1;       // malformed / validation / upstream rejection
@@ -86,6 +103,8 @@ enum ErrorCode {
   ERROR_CODE_INTERNAL = 9;              // unexpected server error
   ERROR_CODE_PIN_NOT_SETUP = 10;        // account has no PIN configured
   ERROR_CODE_INVALID_PIN = 11;          // supplied PIN missing or does not match
+  ERROR_CODE_OTP_REQUIRED = 12;         // trading command sent before OTP was satisfied
+  ERROR_CODE_INVALID_OTP = 13;          // wrong, expired, or rate-limited OTP code
 }
 
 // ===========================================================================

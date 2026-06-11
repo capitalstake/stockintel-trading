@@ -33,12 +33,12 @@ Sec-WebSocket-Protocol: capri.v1
 
 | Scenario | HTTP Response |
 |---|---|
-| Valid token, navy reachable | `101 Switching Protocols` |
+| Valid token, token service reachable | `101 Switching Protocols` |
 | Missing, malformed, unknown, or expired token | `401 Unauthorized` (generic; socket never opens) |
-| Navy unreachable (uncached token) | `503 Service Unavailable` |
+| Token service unreachable (uncached token) | `503 Service Unavailable` |
 
 - The token prefix determines the environment: `si_sb_` → sandbox, `si_lv_` → live.
-- The token is verified once at connect and the session is held for the connection's lifetime. No per-message auth.
+- The token is verified once at connect. For live tokens, the server may additionally require a one-time email code — see the [OTP Gate](#otp-gate-live-tokens-only) section below.
 - The token is **not** re-sent on individual frames.
 
 ---
@@ -69,6 +69,50 @@ These follow a strict request→single-response pattern. You send a `ClientFrame
 ### Server Push Operations
 
 These are unsolicited server→client frames. You receive them automatically from the moment the connection opens — no subscribe step.
+
+---
+
+## OTP Gate (live tokens only)
+
+For live tokens (`si_lv_...`), the server may require a one-time verification code before trading commands are allowed. This happens when your token has not been OTP-verified within the past 7 days.
+
+**When OTP is required**, the `Welcome` frame carries:
+
+| Field | Value |
+|---|---|
+| `otp_required` | `true` |
+| `has_email` | `true` if a code was emailed; `false` if no email is on file |
+| `otp_message` | Human-readable instruction to display to the user |
+
+If `has_email` is `true`, check your email for a 5-digit code, then submit it with `SubmitOtp`. If `has_email` is `false`, add an email address in your **StockIntel settings** and reconnect.
+
+Until OTP succeeds, **all trading and account commands return `ERROR_CODE_OTP_REQUIRED`**. Sandbox tokens are never gated — `otp_required` is always `false`.
+
+### `SubmitOtp`
+
+Submit the 5-digit code emailed after connecting with a live token that requires OTP.
+
+**Request: `SubmitOtpRequest`**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `code` | string | Yes | 5-digit code from your email |
+
+**Response: `SubmitOtpResponse`**
+
+| Field | Type | Notes |
+|---|---|---|
+| `environment` | string | `"live"` |
+| `accounts` | repeated `AccountMeta` | Your now-unlocked trading accounts |
+
+After a successful `SubmitOtp`, trading and account commands are allowed and the session is cached for future reconnects within the 7-day window.
+
+**Error cases:**
+
+| Error | Meaning |
+|---|---|
+| `ERROR_CODE_INVALID_OTP` | Wrong, expired, or rate-limited code (5 attempts per 10 min). Session stays gated. |
+| `ERROR_CODE_INVALID_REQUEST` (`reason: "otp_not_required"`) | Sent `SubmitOtp` when no OTP was required. |
 
 ---
 
@@ -290,9 +334,12 @@ Pushed **once**, immediately after a successful WebSocket upgrade. Carries your 
 | Field | Type | Notes |
 |---|---|---|
 | `environment` | string | `"sandbox"` or `"live"` |
-| `accounts` | repeated `AccountMeta` | Every account linked to your token |
+| `accounts` | repeated `AccountMeta` | Every account linked to your token. Empty when `otp_required` is `true`. |
 | `heartbeat_interval_ms` | uint32 | Server ping cadence (for info; library handles pong) |
 | `server_version` | string | Server version string |
+| `otp_required` | bool | `true` for live tokens that need OTP verification. Always `false` for sandbox. |
+| `has_email` | bool | `true` if an OTP code was emailed. Only meaningful when `otp_required` is `true`. |
+| `otp_message` | string | Human-readable instruction (non-empty only when `otp_required` is `true`). Display this to the user. |
 
 ---
 
@@ -463,6 +510,8 @@ Errors arrive as a `ServerFrame` with the `error` payload, carrying the command'
 | `ERROR_CODE_INTERNAL` | 9 | Unexpected server error | No |
 | `ERROR_CODE_PIN_NOT_SETUP` | 10 | Account has no PIN configured; cannot place/cancel orders | No (set up PIN) |
 | `ERROR_CODE_INVALID_PIN` | 11 | Supplied PIN missing or doesn't match account PIN | No (supply correct PIN) |
+| `ERROR_CODE_OTP_REQUIRED` | 12 | Trading/account command sent before OTP is satisfied | No (send `SubmitOtp` first) |
+| `ERROR_CODE_INVALID_OTP` | 13 | Wrong, expired, or rate-limited OTP code | No (wait for retry window or reconnect to get a new code) |
 
 > **Note:** `UPSTREAM_UNAVAILABLE` is only returned for read commands (`ListOrders`, `GetAccount`, `GetSessionStatus`). `PlaceOrder` and `CancelOrder` do not time out server-side — the server holds them open until the broker responds. Design your client-side timeout logic accordingly: it is not safe to blindly retry an order command without first checking whether the original was accepted.
 

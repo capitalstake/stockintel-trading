@@ -40,7 +40,7 @@ Designed for trading bots, algorithmic strategies, terminal applications, and br
 ```
 
 1. **Connect** — Open a WSS connection with your API token in the `Authorization` header.
-2. **Welcome** — The server immediately sends your environment and linked trading accounts — no extra round-trip.
+2. **Welcome** — The server immediately sends your environment and linked trading accounts. For live tokens, it may require a one-time OTP email verification before accounts are released — check `Welcome.otp_required` and complete `SubmitOtp` if needed. Sandbox tokens are never gated.
 3. **Real-time data flows automatically** — Execution reports and trading-session status are pushed from the moment you connect. No subscriptions needed.
 4. **Send commands** — Place orders, cancel orders, list order history, fetch account balances and positions. Every command gets exactly one response, correlated by a UUID you supply.
 
