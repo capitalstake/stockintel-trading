@@ -40,6 +40,7 @@ Sec-WebSocket-Protocol: capri.v1
 - The token prefix determines the environment: `si_sb_` → sandbox, `si_lv_` → live.
 - The token is verified once at connect. For live tokens, the server may additionally require a one-time email code — see the [OTP Gate](#otp-gate-live-tokens-only) section below.
 - The token is **not** re-sent on individual frames.
+- Tokens are only issued to users who have opened a brokerage account with one of the available brokers through StockIntel. See [Getting Started](./getting-started.md#2-generate-api-tokens) for how to obtain one.
 
 ---
 

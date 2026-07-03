@@ -117,6 +117,8 @@ Protocol Buffers gives you generated, type-safe clients in Python, JavaScript/Ty
 
 Always develop and test against the sandbox first.
 
+> **Note:** Both sandbox and live tokens are only available to users who have opened a brokerage account with one of the available brokers through StockIntel.
+
 ---
 
 ## Next Steps

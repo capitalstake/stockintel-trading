@@ -6,13 +6,15 @@ Connect to the StockIntel Trading API in three steps: get your tokens, compile t
 
 ## 1. Prerequisites
 
-- A trading account at [stockintel.com](https://stockintel.com).
+- A brokerage account opened through StockIntel with one of the available brokers at [stockintel.com](https://stockintel.com). API tokens are only issued to users with a linked brokerage account.
 - Familiarity with Protocol Buffers (proto3) in at least one of Python, JavaScript, Go, or similar.
 - A WebSocket client that can set custom HTTP headers on the upgrade request (the API requires an `Authorization: Bearer` header — browser `WebSocket` constructors cannot set this, so the API is for server-side/programmatic clients only).
 
 ---
 
 ## 2. Generate API Tokens
+
+> **Eligibility:** API tokens (both sandbox and live) are only available to users who have opened a brokerage account with one of the available brokers through StockIntel. If you have not yet opened a brokerage account, do so first — the **API Tokens** section will not issue keys until an account is linked.
 
 Tokens are issued from your StockIntel account dashboard:
 
