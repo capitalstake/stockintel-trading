@@ -35,10 +35,20 @@ Sec-WebSocket-Protocol: capri.v1
 |---|---|
 | Valid token, token service reachable | `101 Switching Protocols` |
 | Missing, malformed, unknown, or expired token | `401 Unauthorized` (generic; socket never opens) |
+| Not entitled to the API | `403 Forbidden`, body is the reason: `not_eligible`, `invalid_plan`, or `ip_not_allowed` |
 | Token service unreachable (uncached token) | `503 Service Unavailable` |
 
+A `403` will not clear by retrying:
+
+| Body | Meaning | What to do |
+|---|---|---|
+| `not_eligible` | No brokerage account opened through StockIntel | Open one, then reconnect |
+| `invalid_plan` | Your subscription is not active | Renew it, then reconnect |
+| `ip_not_allowed` | Your IP is outside the token's allow-list | Connect from an allowed address, or change the token's restrictions |
+
 - The token prefix determines the environment: `si_sb_` → sandbox, `si_lv_` → live.
-- The token is verified once at connect. For live tokens, the server may additionally require a one-time email code — see the [OTP Gate](#otp-gate-live-tokens-only) section below.
+- The token is verified once at connect, and the server may require a one-time code before trading — in **both** environments. See the [OTP Gate](#otp-gate) below.
+- Your plan's limits arrive with the connection in `Welcome.quotas`. See [Plan Quotas](#plan-quotas).
 - The token is **not** re-sent on individual frames.
 - Tokens are only issued to users who have opened a brokerage account with one of the available brokers through StockIntel. See [Getting Started](./getting-started.md#2-generate-api-tokens) for how to obtain one.
 
@@ -69,42 +79,47 @@ These follow a strict request→single-response pattern. You send a `ClientFrame
 
 ### Server Push Operations
 
-These are unsolicited server→client frames. You receive them automatically from the moment the connection opens — no subscribe step.
+These are unsolicited server→client frames. `Welcome`, `ExecutionEvent`, and `TradingSessionStatus` arrive automatically from the moment the connection opens — no subscribe step.
+
+`QuoteUpdate` and `OrderBookUpdate` are the exception: they are per-symbol and high-volume, so you name the symbols you want first. See [Market Data](#market-data).
 
 ---
 
-## OTP Gate (live tokens only)
+## OTP Gate
 
-For live tokens (`si_lv_...`), the server may require a one-time verification code before trading commands are allowed. This happens when your token has not been OTP-verified within the past 7 days.
+The server requires a one-time verification code before trading commands are allowed, whenever your token has not been OTP-verified within the past 7 days. **Both environments are gated**, so a client drives one flow for sandbox and live alike — only the source of the code differs.
 
 **When OTP is required**, the `Welcome` frame carries:
 
 | Field | Value |
 |---|---|
 | `otp_required` | `true` |
-| `has_email` | `true` if a code was emailed; `false` if no email is on file |
+| `has_email` | `true` if a code was emailed; `false` if no email is on file. Meaningless for sandbox — no email is ever sent |
 | `otp_message` | Human-readable instruction to display to the user |
+| `quotas` | Absent — your entitlements are published with your accounts |
 
-If `has_email` is `true`, check your email for a 5-digit code, then submit it with `SubmitOtp`. If `has_email` is `false`, add an email address in your **StockIntel settings** and reconnect.
+- **Live (`si_lv_...`)**: if `has_email` is `true`, check your email for a 5-digit code. If it is `false`, add an email address in your **StockIntel settings** and reconnect.
+- **Sandbox (`si_sb_...`)**: the code is always **`54321`**. Nothing is emailed. It is a published constant, not a secret — the gate exists so sandbox behaves like live.
 
-Until OTP succeeds, **all trading and account commands return `ERROR_CODE_OTP_REQUIRED`**. Sandbox tokens are never gated — `otp_required` is always `false`.
+Until OTP succeeds, **all trading and account commands return `ERROR_CODE_OTP_REQUIRED`**.
 
 ### `SubmitOtp`
 
-Submit the 5-digit code emailed after connecting with a live token that requires OTP.
+Submit the 5-digit code for a session whose `Welcome` carried `otp_required: true`.
 
 **Request: `SubmitOtpRequest`**
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `code` | string | Yes | 5-digit code from your email |
+| `code` | string | Yes | 5-digit code — from your email for live, always `54321` for sandbox |
 
 **Response: `SubmitOtpResponse`**
 
 | Field | Type | Notes |
 |---|---|---|
-| `environment` | string | `"live"` |
+| `environment` | string | `"sandbox"` or `"live"` |
 | `accounts` | repeated `AccountMeta` | Your now-unlocked trading accounts |
+| `quotas` | `Quotas` | The limits now in force — see [Plan Quotas](#plan-quotas) |
 
 After a successful `SubmitOtp`, trading and account commands are allowed and the session is cached for future reconnects within the 7-day window.
 
@@ -114,6 +129,48 @@ After a successful `SubmitOtp`, trading and account commands are allowed and the
 |---|---|
 | `ERROR_CODE_INVALID_OTP` | Wrong, expired, or rate-limited code (5 attempts per 10 min). Session stays gated. |
 | `ERROR_CODE_INVALID_REQUEST` (`reason: "otp_not_required"`) | Sent `SubmitOtp` when no OTP was required. |
+
+---
+
+## Plan Quotas
+
+Your StockIntel plan sets what the API lets you do. The limits arrive with your session in `Welcome.quotas` (or in `SubmitOtpResponse.quotas` if your session was OTP-gated), so you can read them at connect rather than discover them by being refused.
+
+**`-1` means unlimited** on every numeric field.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `orders_per_day` | int32 | Orders you may place per trading day |
+| `api_requests_per_minute` | int32 | Commands per minute. **`PlaceOrder` and `CancelOrder` do not count** against it |
+| `order_types` | repeated `OrderType` | The order types you may place |
+| `good_till_cancelled` | bool | Whether you may set `time_in_force = TIME_IN_FORCE_GTC` |
+| `quote_subscriptions` | int32 | Concurrent quote subscriptions per connection — see [Market Data](#market-data) |
+| `orderbook_subscriptions` | int32 | Concurrent order-book subscriptions per connection |
+| `historical_data_days` | int32 | How far back [`GetHistorical`](#gethistorical) reaches, in **trading days**. `0` means no access |
+| `historical_data_intervals` | repeated string | The candle intervals you may ask for. Currently `1d` — daily candles are the only interval offered |
+
+### What happens when you hit one
+
+| Quota | Error |
+|---|---|
+| `orders_per_day` | `ERROR_CODE_QUOTA_EXCEEDED`, `reason: "daily_order_quota_exceeded"`, with `retry_after_ms` counting down to the next trading day |
+| `api_requests_per_minute` | `ERROR_CODE_RATE_LIMITED`, `reason: "api_rate_exceeded"`, with `retry_after_ms` |
+| `order_types` | `ERROR_CODE_PERMISSION_DENIED`, `reason: "order_type_not_entitled"` |
+| `good_till_cancelled` | `ERROR_CODE_PERMISSION_DENIED`, `reason: "time_in_force_not_entitled"` |
+| `quote_subscriptions` / `orderbook_subscriptions` | Not an error. The symbols past the cap come back in `SubscriptionResponse.rejected` with `SUBSCRIPTION_REJECT_REASON_QUOTA_EXCEEDED` while the rest take effect |
+| `historical_data_intervals` | `ERROR_CODE_PERMISSION_DENIED`, `reason: "historical_interval_not_entitled"` — an interval other than the `1d` currently offered |
+| `historical_data_days` = `0` | `ERROR_CODE_PERMISSION_DENIED`, `reason: "historical_data_not_entitled"` |
+| `historical_data_days` exceeded | Not an error. The range is **trimmed** to what the plan covers and served — see [`GetHistorical`](#gethistorical) |
+
+### Rules worth knowing
+
+- **A day is a trading day in market time (`Asia/Karachi`)**, not a UTC day — your allowance turns over between sessions, not mid-session.
+- **Only accepted orders count.** An order rejected by validation or by a limit costs nothing. An order the broker later rejects is *not* refunded — the cap is on order flow you push at the market.
+- **Reconnecting does not reset anything.** Counters follow your user and environment, not your connection or your token, so a fresh socket or a new token starts where the old one left off. Sandbox and live count separately.
+- **Sandbox always runs on the default plan limits**, whatever your live plan grants.
+- **Subscription caps are concurrency, not consumption.** They limit how many symbols you may hold at once; unsubscribing frees the allowance immediately, and there is no daily total.
+- **Market data is entitled by plan alone.** Any symbol the exchange publishes is readable by any entitled session — unlike trading, which is scoped to the accounts on your token.
+- The `5 orders/sec` burst limit applies on top of these quotas, and is not part of your plan.
 
 ---
 
@@ -326,6 +383,161 @@ Current trading session status for a broker + market — a point-in-time query. 
 
 ---
 
+## Market Data
+
+Quotes and order books are **not** pushed from connect. They are per-symbol and high-volume, unlike the entitlement-scoped execution and session-status streams, so you name the symbols you want.
+
+Four commands — subscribe and unsubscribe, quotes and order book — all answer with the same `SubscriptionResponse`. Updates then arrive as `QuoteUpdate` and `OrderBookUpdate` pushes.
+
+Both streams are **snapshot-based**: every message carries a symbol's full state rather than a delta against the last one. Three things follow from that, and they are the whole design:
+
+- **A slow client loses frames, not its connection.** Each connection has a second, separate queue for market data, so a burst of quotes can never cost you an execution report. When it overflows, market-data frames are dropped; the socket stays open. (The trading queue still closes the socket with `4004` / `SLOW_CONSUMER` — that data is not replaceable.)
+- **Subscribing replays the last known snapshot immediately**, so you see data without waiting for the market to move — or, outside session hours, at all.
+- **There is no sequence number and no gap recovery**, because a missed frame costs nothing the next frame will not carry. Do not build resync logic for this stream.
+
+If the server has no market-data feed configured, every subscribe is refused with `ERROR_CODE_UPSTREAM_UNAVAILABLE` (`reason: "market_data_disabled"`). Trading is unaffected — a feed outage does not gate the API.
+
+### `SubscribeQuotes` / `SubscribeOrderBook`
+
+**Request: `SubscribeQuotesRequest` / `SubscribeOrderBookRequest`**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `symbols` | repeated `SymbolRef` | Yes | At most **500** per request |
+
+`SymbolRef` is `{ market: Market, symbol: string }` — the same shape in both directions.
+
+Symbols are **resolved individually, never all-or-nothing.** Malformed symbols and those past your plan's cap come back in `rejected` while the rest take effect. Only a request that is wrong as a whole — market data not configured, or more than 500 symbols — is answered with an `Error` instead of a `SubscriptionResponse`.
+
+Subscribing to a symbol you already hold is accepted and consumes no further allowance. Duplicates within one request collapse to one.
+
+Symbols are **not** checked against a universe of known instruments: the feed is the only authority on what exists. A well-formed subscription to a symbol that never trades is accepted and simply stays silent.
+
+### `UnsubscribeQuotes` / `UnsubscribeOrderBook`
+
+**Request: `UnsubscribeQuotesRequest` / `UnsubscribeOrderBookRequest`**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `symbols` | repeated `SymbolRef` | No | **Empty drops every subscription** on that stream |
+
+Unsubscribing a symbol you never held is not an error — it is simply absent from `accepted`.
+
+### `SubscriptionResponse`
+
+Answers all four commands. Which oneof slot it arrives in tells you which command it answers.
+
+| Field | Type | Notes |
+|---|---|---|
+| `accepted` | repeated `SymbolRef` | Now subscribed. On unsubscribe, the ones removed |
+| `rejected` | repeated `SubscriptionRejection` | Per-symbol refusals, with a reason each |
+| `active` | int32 | Your subscription count for this stream **after** the change |
+| `limit` | int32 | Your plan's cap on it (`-1` unlimited) |
+
+`active` is authoritative — track it rather than counting your own subscribes.
+
+### `SubscriptionRejectReason`
+
+| Value | Meaning |
+|---|---|
+| `SUBSCRIPTION_REJECT_REASON_QUOTA_EXCEEDED` (1) | Your plan's concurrent-subscription cap is already spent |
+| `SUBSCRIPTION_REJECT_REASON_INVALID_SYMBOL` (2) | `market` is `UNSPECIFIED`, or `symbol` is empty or over 32 characters |
+| `SUBSCRIPTION_REJECT_REASON_UNSUPPORTED_MARKET` (3) | That market publishes nothing on this stream — indices have no order book |
+
+### `QuoteUpdate`
+
+A full quote snapshot for one symbol.
+
+| Field | Type | Notes |
+|---|---|---|
+| `market` / `symbol` | `Market` / string | Which instrument |
+| `state` | `SessionStatus` | The market's session state at this snapshot |
+| `timestamp` | Timestamp | When the feed published it |
+| `open` / `high` / `low` / `close` | double | The day's prices. `close` is the last traded price, not a settled close |
+| `volume` | int64 | Shares traded today |
+| `last_day_close` | double | Yesterday's close (LDCP), the reference `change` is measured from |
+| `change` / `change_percent` | double | Against `last_day_close` |
+| `bid_price` / `bid_quantity` | double / int64 | Best bid |
+| `ask_price` / `ask_quantity` | double / int64 | Best ask |
+| `value` | double | Traded value for the day, in currency rather than shares |
+| `trades` | int64 | Trade count for the day |
+| `last_trade` | `LastTrade` | Absent when the symbol has not traded yet |
+
+`LastTrade` is `{ timestamp, price, quantity }`.
+
+### `OrderBookUpdate`
+
+A full order-book snapshot for one symbol.
+
+| Field | Type | Notes |
+|---|---|---|
+| `market` / `symbol` | `Market` / string | Which instrument |
+| `timestamp` | Timestamp | When the feed published it |
+| `buy` / `sell` | `OrderBookSide` | The two sides |
+
+`OrderBookSide` carries `weighted_avg_price` and `total_quantity` for the **whole** side — including levels beyond those listed — plus `levels`, best price first. The exchange publishes up to 10.
+
+Each `OrderBookLevel` is `{ level, price, quantity, order_count }`, where `order_count` is how many separate orders rest at that price.
+
+Indices (`MARKET_IDX`) are rejected on this stream: they are computed from the market rather than traded, so they have no resting orders.
+
+---
+
+## Historical Data
+
+### `GetHistorical`
+
+One symbol's history over a time range. Unlike quotes and the order book this is a plain request/response — history does not change, so there is nothing to stream and nothing to hold open.
+
+**Request: `GetHistoricalRequest`**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `market` | `Market` | Yes | Required though history is keyed by symbol alone today, so an instrument is named the same way here as in a subscription |
+| `symbol` | string | Yes | Up to 32 characters |
+| `interval` | string | Yes | `1d`. Read the codes your plan grants from `historical_data_intervals` rather than hard-coding this |
+| `time_from` | Timestamp | Yes | Start of the range |
+| `time_to` | Timestamp | Yes | End of the range. Must be after `time_from` |
+
+**Both bounds are required.** An open-ended range would have to be closed with a server-side default, and a client that meant something else would never find out.
+
+**One request may cover at most 90 days** at `1d`. A wider range is refused with `ERROR_CODE_INVALID_REQUEST` (`reason: "range_too_large"`) — page through longer histories by asking again with an earlier range.
+
+The cap is per interval, so it will change if finer intervals are offered later: a range costs what it resolves into, and a year of daily candles is a very different answer from a year of minute ones. Read `historical_data_intervals` at connect rather than assuming the set.
+
+**Response: `GetHistoricalResponse`**
+
+| Field | Type | Notes |
+|---|---|---|
+| `market` / `symbol` / `interval` | | Echo the request, so a client holding several charts can route a result without tracking `request_id`s itself |
+| `data` | repeated `HistoricalData` | Ordered **oldest first** |
+| `time_from` / `time_to` | Timestamp | The range **actually served** — see below |
+
+`HistoricalData` is one interval of trading, as a candle: `{ timestamp, open, high, low, close, volume }`.
+
+`timestamp` is where the interval **closes** — the last trade counted into it — so a daily point is stamped at the session's close rather than its open.
+
+### Reaching further back than your plan covers
+
+This is **not** an error. The range is trimmed to your plan's last `historical_data_days` sessions and served, and the response's `time_from` reports what it was trimmed to. Compare it against what you asked for to know it happened; a client charting further back pages by asking again with an earlier range.
+
+Two cases are still refused outright:
+
+| Case | Error |
+|---|---|
+| `historical_data_days` is `0` | `ERROR_CODE_PERMISSION_DENIED`, `reason: "historical_data_not_entitled"` |
+| The range lies **entirely** outside the plan's window | `ERROR_CODE_PERMISSION_DENIED`, `reason: "historical_window_not_entitled"` |
+
+The second is refused rather than trimmed because there is nothing to trim it to, and an empty result would be indistinguishable from a symbol that did not trade.
+
+**Days are counted in trading days**, so a seven-day plan reaches seven *sessions* back however many weekends and market holidays lie between them.
+
+A range the symbol never traded in comes back **empty rather than as an error**.
+
+If the server has no market-data feed configured, the request is refused with `ERROR_CODE_UPSTREAM_UNAVAILABLE` (`reason: "historical_data_disabled"`).
+
+---
+
 ## Server Pushes
 
 ### `Welcome`
@@ -338,9 +550,10 @@ Pushed **once**, immediately after a successful WebSocket upgrade. Carries your 
 | `accounts` | repeated `AccountMeta` | Every account linked to your token. Empty when `otp_required` is `true`. |
 | `heartbeat_interval_ms` | uint32 | Server ping cadence (for info; library handles pong) |
 | `server_version` | string | Server version string |
-| `otp_required` | bool | `true` for live tokens that need OTP verification. Always `false` for sandbox. |
-| `has_email` | bool | `true` if an OTP code was emailed. Only meaningful when `otp_required` is `true`. |
+| `otp_required` | bool | `true` when the token needs OTP verification. Applies to both environments. |
+| `has_email` | bool | `true` if an OTP code was emailed. Only meaningful for a gated **live** token. |
 | `otp_message` | string | Human-readable instruction (non-empty only when `otp_required` is `true`). Display this to the user. |
+| `quotas` | `Quotas` | What your plan entitles you to. Absent while `otp_required` is `true`. See [Plan Quotas](#plan-quotas). |
 
 ---
 
@@ -411,8 +624,17 @@ Pushed **automatically** when a market's trading session status changes. You onl
 | `MARKET_SIF` (8) | Stock Index Futures |
 | `MARKET_IOM` (9) | Index Options Market |
 | `MARKET_SOM` (10) | Stock Options Market |
+| `MARKET_IDX` (11) | Indices. Quote-only — no order book, never tradeable |
+| `MARKET_CSF` (12) | Cash-Settled Futures. Market data only |
+| `MARKET_TRM` (13) | Term Finance. Market data only |
+
+Markets 1–10 carry order flow. 11–13 arrive only on the market-data feed, which publishes segments there is no trading on.
+
+The feed spells three markets differently from the trading system, and the API reports one name for each either way: feed `FSQ` is `MARKET_FSR`, `IOPT` is `MARKET_IOM`, and `SOPT` is `MARKET_SOM`. You never see the feed's spelling.
 
 ### `OrderType`
+
+Which of these you may place depends on your plan — see [Plan Quotas](#plan-quotas).
 
 | Value | Description |
 |---|---|
@@ -497,7 +719,7 @@ Errors arrive as a `ServerFrame` with the `error` payload, carrying the command'
 | `code` | `ErrorCode` enum | |
 | `message` | string | Safe, human-readable summary |
 | `reason` | string | Machine-readable upstream/internal reason |
-| `retry_info` | `RetryInfo` | Present on `RATE_LIMITED` only |
+| `retry_info` | `RetryInfo` | Present on `RATE_LIMITED` and `QUOTA_EXCEEDED` |
 
 ### `ErrorCode`
 
@@ -505,16 +727,17 @@ Errors arrive as a `ServerFrame` with the `error` payload, carrying the command'
 |---|---|---|---|
 | `ERROR_CODE_INVALID_REQUEST` | 1 | Malformed fields, validation failure, or upstream rejection | No (fix request) |
 | `ERROR_CODE_UNAUTHENTICATED` | 2 | Mid-connection deauthorization (reserved) | No |
-| `ERROR_CODE_PERMISSION_DENIED` | 3 | Account not owned, inactive for trading, or environment mismatch | No |
-| `ERROR_CODE_RATE_LIMITED` | 6 | Order rate (5/sec) exceeded, or duplicate read in-flight | Yes (honor `retry_after_ms`) |
+| `ERROR_CODE_PERMISSION_DENIED` | 3 | Account not owned, inactive for trading, environment mismatch, or an order type your plan does not include | No |
+| `ERROR_CODE_RATE_LIMITED` | 6 | Order rate (5/sec) exceeded, duplicate read in-flight, or your plan's per-minute request quota exhausted | Yes (honor `retry_after_ms`) |
 | `ERROR_CODE_UPSTREAM_UNAVAILABLE` | 7 | Trading system down or read request timed out | Yes (backoff) |
 | `ERROR_CODE_INTERNAL` | 9 | Unexpected server error | No |
 | `ERROR_CODE_PIN_NOT_SETUP` | 10 | Account has no PIN configured; cannot place/cancel orders | No (set up PIN) |
 | `ERROR_CODE_INVALID_PIN` | 11 | Supplied PIN missing or doesn't match account PIN | No (supply correct PIN) |
 | `ERROR_CODE_OTP_REQUIRED` | 12 | Trading/account command sent before OTP is satisfied | No (send `SubmitOtp` first) |
 | `ERROR_CODE_INVALID_OTP` | 13 | Wrong, expired, or rate-limited OTP code | No (wait for retry window or reconnect to get a new code) |
+| `ERROR_CODE_QUOTA_EXCEEDED` | 14 | Your plan's daily order quota is spent | Yes, but not today — `retry_after_ms` is the wait until the next trading day |
 
-> **Note:** `UPSTREAM_UNAVAILABLE` is only returned for read commands (`ListOrders`, `GetAccount`, `GetSessionStatus`). `PlaceOrder` and `CancelOrder` do not time out server-side — the server holds them open until the broker responds. Design your client-side timeout logic accordingly: it is not safe to blindly retry an order command without first checking whether the original was accepted.
+> **Note:** `UPSTREAM_UNAVAILABLE` is only returned for read commands (`ListOrders`, `GetAccount`, `GetSessionStatus`, `GetHistorical`) and for market-data subscribes when no feed is configured. `PlaceOrder` and `CancelOrder` do not time out server-side — the server holds them open until the broker responds. Design your client-side timeout logic accordingly: it is not safe to blindly retry an order command without first checking whether the original was accepted.
 
 ### `RetryInfo`
 
@@ -543,12 +766,15 @@ Application close codes (4000–4999) and standard codes tell you why the socket
 
 ## Rate Limits
 
+These apply to every connection regardless of plan:
+
 | Limit | Scope |
 |---|---|
 | **5 orders/sec** (`PlaceOrder` + `CancelOrder`) | Per connection |
-| **Duplicate read rejection** | An identical read command still awaiting its result is rejected with `RATE_LIMITED` (`reason = "duplicate_in_flight"`) |
+| **Duplicate read rejection** | An identical read command still awaiting its result is rejected with `RATE_LIMITED` (`reason = "duplicate_in_flight"`). Applies to `GetHistorical` too — repeating a query while the first is in flight asks the upstream twice for the same answer |
+| **500 symbols per subscribe** | One subscribe or unsubscribe may name at most 500 symbols (`reason = "too_many_symbols"`) |
 
-Server pushes are never throttled. There is no per-minute request ceiling.
+Your plan adds a per-minute request cap and a daily order cap on top — see [Plan Quotas](#plan-quotas). Server pushes are never throttled.
 
 ---
 
@@ -595,7 +821,11 @@ The server validates all commands before forwarding upstream. Failures return `E
 6. **Correlate external executions** — executions for orders placed outside your connection carry empty `request_id`; use `broker_order_id` / `exchange_order_id`.
 7. **Reconnect with backoff** — on socket drop, reconnect with exponential backoff and resync via `ListOrders`. Execution events restart after reconnect but events missed during the gap are not replayed; reconcile open orders by diffing `ListOrders` against your locally tracked state.
 8. **Do not auto-reconnect on `4002`** — `SESSION_SUPERSEDED` means another connection took over. Fix the duplicate.
-9. **Honor `retry_after_ms`** — on `RATE_LIMITED`, wait before retrying.
+9. **Honor `retry_after_ms`** — on `RATE_LIMITED` and `QUOTA_EXCEEDED`, wait before retrying. On a daily quota that wait runs to the next trading day; stop placing orders rather than spinning.
+10. **Read your quotas at connect** — `Welcome.quotas` tells you your order types and caps. Check `order_types` before offering an order type to a user, rather than discovering it with a rejection.
+11. **Read `SubscriptionResponse.rejected`** — a subscribe that succeeds partially still succeeds. Check which symbols were refused rather than assuming you hold everything you asked for, and track `active` rather than counting your own subscribes.
+12. **Do not build gap recovery for market data** — both streams are snapshots, so a dropped frame is superseded by the next one. Re-subscribing after a reconnect is all the resync there is.
+13. **Compare `GetHistoricalResponse.time_from` against what you asked for** — a range reaching past your plan's window is trimmed and served, not refused. Without the comparison, a short answer looks like missing data.
 
 ---
 

@@ -14,8 +14,9 @@ Designed for trading bots, algorithmic strategies, terminal applications, and br
 | **Public endpoint** | `wss://trading.stockintel.com/ws/v1` |
 | **Wire format** | Protocol Buffers (proto3), binary frames |
 | **Authentication** | Bearer token in the WebSocket upgrade `Authorization` header |
-| **API style** | Command/response for reads; fire-and-acknowledge for orders; automatic server push for real-time data |
-| **Rate limit** | 5 orders per second per connection |
+| **API style** | Command/response for reads; fire-and-acknowledge for orders; automatic server push for execution and session data; per-symbol subscriptions for market data |
+| **Market data** | Real-time quotes and 10-deep order books by subscription, plus historical candles on request |
+| **Rate limit** | 5 orders per second per connection, plus your plan's per-minute and daily quotas |
 | **Environments** | Sandbox (test) and Live (production) — separate tokens |
 
 ---
@@ -40,9 +41,10 @@ Designed for trading bots, algorithmic strategies, terminal applications, and br
 ```
 
 1. **Connect** — Open a WSS connection with your API token in the `Authorization` header.
-2. **Welcome** — The server immediately sends your environment and linked trading accounts. For live tokens, it may require a one-time OTP email verification before accounts are released — check `Welcome.otp_required` and complete `SubmitOtp` if needed. Sandbox tokens are never gated.
+2. **Welcome** — The server immediately sends your environment, linked trading accounts and your plan's quotas. It may first require a one-time code before releasing them — check `Welcome.otp_required` and complete `SubmitOtp` if so. **Both environments are gated**: live codes are emailed, and the sandbox code is always `54321`.
 3. **Real-time data flows automatically** — Execution reports and trading-session status are pushed from the moment you connect. No subscriptions needed.
 4. **Send commands** — Place orders, cancel orders, list order history, fetch account balances and positions. Every command gets exactly one response, correlated by a UUID you supply.
+5. **Subscribe to market data** — Quotes and order books are per-symbol and high-volume, so you name the symbols you want. Subscribing replays the latest snapshot immediately. Historical candles are a plain request/response.
 
 ---
 
@@ -52,6 +54,8 @@ Designed for trading bots, algorithmic strategies, terminal applications, and br
 - **Fire-and-acknowledge orders** — `PlaceOrder` returns an immediate empty acknowledgement. All outcomes (fills, rejections, cancels) arrive on the real-time execution stream, keyed by your own correlation ID.
 - **One connection per token** — The WebSocket *is* your session. Sandbox and live are separate tokens, so you can run one of each concurrently. A token can only have one active connection at a time (newest-wins takeover).
 - **Stateless server** — No server-side persistence. Reconnect and resync via the execution stream and `ListOrders`.
+- **Snapshot market data** — Every quote and order-book message carries the symbol's full state, not a delta. A slow client has market-data frames dropped rather than its connection closed, and there is no gap recovery to implement: the next frame carries everything the missed one did.
+- **Plan-scoped** — Order types, daily order count, request rate, concurrent subscriptions and historical depth all come from your plan, published in `Welcome.quotas` so you can read them rather than discover them by being refused.
 
 ---
 
@@ -117,7 +121,7 @@ Protocol Buffers gives you generated, type-safe clients in Python, JavaScript/Ty
 
 Always develop and test against the sandbox first.
 
-> **Note:** Both sandbox and live tokens are only available to users who have opened a brokerage account with one of the available brokers through StockIntel.
+> **Note:** Both sandbox and live tokens are only available to users who have opened a brokerage account with one of the available brokers through StockIntel, and require an active plan. Your plan also sets your API limits — daily orders, requests per minute, and available order types. See [Plan Quotas](./api-reference.md#plan-quotas).
 
 ---
 

@@ -8,12 +8,17 @@ Every message on the StockIntel Trading API is a **Protocol Buffers** (proto3) b
 
 The API defines two top-level envelope messages:
 
-- **`ClientFrame`** — every message your client sends (commands: place/cancel orders, list orders, get account, get session status).
-- **`ServerFrame`** — every message the server sends back (command responses, execution events, session status updates, errors, and the initial Welcome).
+- **`ClientFrame`** — every message your client sends (commands: place/cancel orders, list orders, get account, get session status, subscribe to market data, fetch history).
+- **`ServerFrame`** — every message the server sends back (command responses, execution events, session status updates, quote and order-book updates, errors, and the initial Welcome).
 
 All frames are **binary** WebSocket messages (opcode 0x2). Text frames are rejected. Each frame contains exactly one serialized `ClientFrame` or `ServerFrame`.
 
-The schema also defines all request/response messages, enums (market, order type, order side, time-in-force, order status, session status, error codes), and the `google.protobuf.Timestamp` import for timestamps. For live tokens, the protocol includes an OTP gate — see [Handling OTP (live tokens)](#handling-otp-live-tokens) below.
+The schema also defines all request/response messages, enums (market, order type, order side, time-in-force, order status, session status, error codes, subscription reject reasons), and the `google.protobuf.Timestamp` import for timestamps. The protocol includes an OTP gate in both environments — see [Handling OTP](#handling-otp) below.
+
+Two details of the market-data messages are worth knowing before you generate code against them:
+
+- **All four subscribe/unsubscribe commands answer with the same `SubscriptionResponse` type.** In `ServerFrame` they occupy four distinct `oneof` slots — `subscribe_quotes`, `unsubscribe_quotes`, `subscribe_order_book`, `unsubscribe_order_book` — so the slot the answer arrives in, not its type, tells you which command it answers.
+- **A command and the result answering it carry the same field number** in their respective envelopes. `get_historical` is 46 in both. Tags 44 and 45 are the market-data pushes on the server side and stay unused on the client side rather than being filled in.
 
 ---
 
@@ -428,17 +433,21 @@ The `.proto` file is standard proto3 and compiles with `protoc` for any supporte
 
 4. **Duplicate reads** — Sending a read command identical to one already awaiting its result (same `oneof` type with same field values, excluding `request_id`) is rejected with `RATE_LIMITED` (`reason = "duplicate_in_flight"`). Wait for the first result before retrying.
 
-5. **Welcome frame** — The first message after a successful connect is always a `ServerFrame` with the `welcome` payload. Your client must read it before sending commands. It arrives immediately; you won't miss it. For live tokens, check `welcome.otp_required` — if `true`, complete `SubmitOtp` before sending any other commands (see [Handling OTP](#handling-otp-live-tokens)).
+5. **Welcome frame** — The first message after a successful connect is always a `ServerFrame` with the `welcome` payload. Your client must read it before sending commands. It arrives immediately; you won't miss it. Check `welcome.otp_required` — if `true`, complete `SubmitOtp` before sending any other commands (see [Handling OTP](#handling-otp)). Once unlocked, `welcome.quotas` (or `submit_otp.quotas`) carries your plan's limits.
 
 6. **Execution ordering** — An `ExecutionEvent` for your order may arrive **before** the `PlaceOrderResponse` acknowledgement. Always be ready to receive executions tagged with a `request_id` you just sent, even before the ack.
 
-7. **Keepalive** — The server sends native WebSocket pings. Your library should handle pong responses automatically. Do not implement application-level ping/pong — the `Ping`/`Pong` messages in the proto are reserved and not used.
+7. **Market-data `oneof` slots** — Because all four subscription commands share the `SubscriptionResponse` type, checking the type tells you nothing. Check the slot: `HasField("subscribe_quotes")` versus `HasField("unsubscribe_quotes")`, and so on.
+
+8. **Optional message presence** — `Welcome.quotas`, `QuoteUpdate.last_trade`, and `GetHistoricalResponse.time_from` / `time_to` are all absent in ordinary cases: quotas while OTP is pending, `last_trade` for a symbol that has not traded, the served range on an older server. Use `HasField` rather than reading a zero value and treating it as real.
+
+9. **Keepalive** — The server sends native WebSocket pings. Your library should handle pong responses automatically. Do not implement application-level ping/pong — the `Ping`/`Pong` messages in the proto are reserved and not used.
 
 ---
 
-## Handling OTP (live tokens)
+## Handling OTP
 
-Live tokens may require a one-time email code before trading commands are allowed. This section shows the pattern in Python; the same logic applies in any language.
+A token may require a one-time code before trading commands are allowed, whenever it has not been verified in the past 7 days. **Both environments are gated**, so one code path covers sandbox and live: live codes are emailed, and the sandbox code is always the published constant `54321`. This section shows the pattern in Python; the same logic applies in any language.
 
 **After connecting, always check `Welcome.otp_required`:**
 
@@ -463,15 +472,19 @@ async def connect_with_otp(token, get_code_fn):
     print(f"Connected: env={welcome.environment}")
 
     if welcome.otp_required:
-        if not welcome.has_email:
-            # No email on file — cannot receive a code.
-            print(welcome.otp_message)  # tells user to add email in StockIntel settings
+        print(welcome.otp_message)  # always says where this session's code comes from
+
+        if welcome.environment == "sandbox":
+            # Sandbox is gated so it behaves like live, but the code is fixed
+            # and published — nothing is emailed.
+            code = "54321"
+        elif not welcome.has_email:
+            # Live with no email on file — cannot receive a code.
             await ws.close()
             raise RuntimeError("OTP required but no email configured")
-
-        # OTP code was emailed — prompt the user (or read from stdin/config).
-        print(welcome.otp_message)  # "A one-time code has been sent to your email..."
-        code = get_code_fn()        # e.g. input("Enter code: ")
+        else:
+            # The code was emailed — prompt the user (or read from stdin/config).
+            code = get_code_fn()    # e.g. input("Enter code: ")
 
         # Submit the code.
         cmd = capri_pb2.ClientFrame()
@@ -492,16 +505,19 @@ async def connect_with_otp(token, get_code_fn):
 
         otp_resp = resp_frame.submit_otp
         print(f"OTP verified. Accounts: {[a.client_code for a in otp_resp.accounts]}")
+        print(f"Plan allows {otp_resp.quotas.orders_per_day} orders/day")
         return ws, otp_resp.accounts
 
     else:
-        # No OTP needed — accounts are in Welcome directly.
+        # No OTP needed — accounts and quotas are in Welcome directly.
         return ws, list(welcome.accounts)
 ```
 
 **Key points:**
-- `otp_required: false` — accounts are in `Welcome.accounts`; proceed normally.
-- `otp_required: true, has_email: true` — display `Welcome.otp_message`, collect the code, send `SubmitOtp`.
-- `otp_required: true, has_email: false` — display `Welcome.otp_message` (directs user to add email in StockIntel settings), then close the connection; there is no way to complete OTP in this session.
+- `otp_required: false` — accounts and `quotas` are in `Welcome`; proceed normally.
+- `otp_required: true`, sandbox — submit `54321`. It is documented, not secret; the gate exists so sandbox mirrors live. `has_email` is meaningless here.
+- `otp_required: true, has_email: true` — display `Welcome.otp_message`, collect the emailed code, send `SubmitOtp`.
+- `otp_required: true, has_email: false` on a **live** token — display `Welcome.otp_message` (directs the user to add an email in StockIntel settings), then close the connection; there is no way to complete OTP in this session.
+- Whichever path you take, read `quotas` from the frame that releases your accounts — it tells you your daily order cap, your per-minute request cap, and the order types your plan includes. See [API Reference — Plan Quotas](./api-reference.md#plan-quotas).
 - After successful `SubmitOtp`, accounts are in `SubmitOtpResponse.accounts`; the session is unlocked and cached for future reconnects within the 7-day window.
-- **Sandbox tokens never require OTP.** `otp_required` is always `false` for `si_sb_...` tokens.
+- **Both environments are gated.** A sandbox token is asked for a code on first connect and again once its 7-day window lapses, exactly as a live one is — only the source of the code differs.

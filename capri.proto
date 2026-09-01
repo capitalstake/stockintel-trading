@@ -4,24 +4,14 @@ package capri.v1;
 
 import "google/protobuf/timestamp.proto";
 
-// ===========================================================================
-// StockIntel Trading API — Protocol Buffers Schema
-// ===========================================================================
-//
-// Public endpoint: wss://trading.stockintel.com/ws/v1
-//
-// Every binary WebSocket frame carries exactly one ClientFrame (client→server)
-// or ServerFrame (server→client).  Authentication is via a Bearer token in the
-// HTTP Authorization header of the WebSocket upgrade request.
-//
-// See docs/public/ for the full API reference and getting-started guide.
+option go_package = "github.com/capitalstake/capri/proto/capri/v1;capriv1";
 
 // ===========================================================================
-// Envelopes
+// Envelopes — every binary WebSocket frame is exactly one of these.
 // ===========================================================================
 
-// Client → server.  request_id is a client-generated UUID string, never reused
-// on a connection; the server echoes it on the matching result or Error.
+// Client → server. request_id is a client-generated UUID string, never reused
+// on a connection; the server echoes it on the matching result/Error.
 message ClientFrame {
   string request_id = 1;
 
@@ -33,12 +23,22 @@ message ClientFrame {
     GetAccountRequest       get_account        = 14;
     GetSessionStatusRequest get_session_status = 15;
     SubmitOtpRequest        submit_otp         = 16;
+
+    SubscribeQuotesRequest      subscribe_quotes       = 40;
+    UnsubscribeQuotesRequest    unsubscribe_quotes     = 41;
+    SubscribeOrderBookRequest   subscribe_order_book   = 42;
+    UnsubscribeOrderBookRequest unsubscribe_order_book = 43;
+
+    // 44 and 45 are the market-data pushes on the server side. A command and
+    // the result answering it carry the same tag in both envelopes, so those
+    // two numbers stay unused here rather than being filled in.
+    GetHistoricalRequest        get_historical         = 46;
   }
   reserved 30;
 }
 
-// Server → client.  For a command result, request_id mirrors the ClientFrame
-// it answers.  For server pushes (Welcome, ExecutionEvent, TradingSessionStatus)
+// Server → client. For a command result, request_id mirrors the ClientFrame it
+// answers. For server pushes (Welcome, ExecutionEvent, TradingSessionStatus)
 // request_id is empty ("").
 message ServerFrame {
   string request_id = 1;
@@ -55,74 +55,108 @@ message ServerFrame {
     ExecutionEvent           execution_event     = 20;
     TradingSessionStatus     session_status      = 21;
     Error                    error               = 30;
+
+    SubscriptionResponse subscribe_quotes       = 40;
+    SubscriptionResponse unsubscribe_quotes     = 41;
+    SubscriptionResponse subscribe_order_book   = 42;
+    SubscriptionResponse unsubscribe_order_book = 43;
+    QuoteUpdate          quote_update           = 44;
+    OrderBookUpdate      order_book_update      = 45;
+
+    GetHistoricalResponse get_historical = 46;
   }
   reserved 31;
 }
 
 // Pushed immediately after a successful upgrade.
-// For live tokens that require OTP, otp_required is true and accounts is empty.
-// Submit a SubmitOtpRequest to unlock accounts before sending trading commands.
 message Welcome {
-  string environment = 1;             // "sandbox" | "live"
-  repeated AccountMeta accounts = 2;  // empty when otp_required is true
+  string environment = 1;
+  repeated AccountMeta accounts = 2;
   uint32 heartbeat_interval_ms = 3;
   string server_version = 4;
-  bool otp_required = 5;              // true: live token must complete OTP before trading
-  bool has_email = 6;                 // true: OTP code was emailed; false: add email in settings
-  string otp_message = 7;             // human-readable instruction (non-empty when otp_required)
+  bool otp_required = 5;
+  bool has_email = 6;
+  string otp_message = 7;
+  Quotas quotas = 8;
 }
 
 message Error {
   ErrorCode code = 1;
-  string message = 2;                 // safe, human-readable
-  string reason = 3;                  // machine-readable upstream/internal reason
-  RetryInfo retry_info = 4;           // present on RATE_LIMITED
+  string message = 2;
+  string reason = 3;
+  RetryInfo retry_info = 4;
 }
 
 message RetryInfo {
   uint32 retry_after_ms = 1;
 }
 
-// OTP verification messages (live tokens only; sandbox is never gated).
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_INVALID_REQUEST = 1;
+  ERROR_CODE_UNAUTHENTICATED = 2;
+  ERROR_CODE_PERMISSION_DENIED = 3;
+  ERROR_CODE_RATE_LIMITED = 6;
+  ERROR_CODE_UPSTREAM_UNAVAILABLE = 7;
+  ERROR_CODE_INTERNAL = 9;
+  ERROR_CODE_PIN_NOT_SETUP = 10;
+  ERROR_CODE_INVALID_PIN = 11;
+  ERROR_CODE_OTP_REQUIRED = 12;
+  ERROR_CODE_INVALID_OTP = 13;
+  ERROR_CODE_QUOTA_EXCEEDED = 14;
+}
+
 message SubmitOtpRequest {
-  string code = 1;                    // 5-digit code from email; token is implicit to the connection
+  string code = 1;
 }
 
 message SubmitOtpResponse {
   string environment = 1;
-  repeated AccountMeta accounts = 2;  // the now-unlocked accounts
+  repeated AccountMeta accounts = 2;
+  Quotas quotas = 3;
 }
 
-enum ErrorCode {
-  ERROR_CODE_UNSPECIFIED = 0;
-  ERROR_CODE_INVALID_REQUEST = 1;       // malformed / validation / upstream rejection
-  ERROR_CODE_UNAUTHENTICATED = 2;       // token revoked or expired mid-connection (reserved)
-  ERROR_CODE_PERMISSION_DENIED = 3;     // account not owned, inactive for trading, env mismatch
-  ERROR_CODE_RATE_LIMITED = 6;          // order rate (5/sec) exceeded, or duplicate read in flight
-  ERROR_CODE_UPSTREAM_UNAVAILABLE = 7;  // trading system down, or request timed out
-  ERROR_CODE_INTERNAL = 9;              // unexpected server error
-  ERROR_CODE_PIN_NOT_SETUP = 10;        // account has no PIN configured
-  ERROR_CODE_INVALID_PIN = 11;          // supplied PIN missing or does not match
-  ERROR_CODE_OTP_REQUIRED = 12;         // trading command sent before OTP was satisfied
-  ERROR_CODE_INVALID_OTP = 13;          // wrong, expired, or rate-limited OTP code
+// Plan entitlements for the session, published by navy and enforced by Capri.
+// -1 means unlimited on every numeric field.
+message Quotas {
+  int32 orders_per_day = 1;
+  int32 api_requests_per_minute = 2;
+  repeated OrderType order_types = 3;
+  bool good_till_cancelled = 4;
+  int32 quote_subscriptions = 5;
+  int32 orderbook_subscriptions = 6;
+  int32 historical_data_days = 7;
+  repeated string historical_data_intervals = 8;
 }
 
 // ===========================================================================
 // Enums
 // ===========================================================================
 
+// Markets Capri reports. 1-10 are the markets skye names for trading; 11-13
+// arrive only on the market-data feed, which publishes segments skye has no
+// order flow for.
+//
+// Three feed codes are the same market skye names differently and map onto the
+// existing members rather than gaining their own: FSQ is MARKET_FSR, IOPT is
+// MARKET_IOM, SOPT is MARKET_SOM. A client therefore sees one name per market
+// whether the frame came from a quote or an execution.
 enum Market {
   MARKET_UNSPECIFIED = 0;
-  MARKET_REG = 1;  // Regular
-  MARKET_BNB = 2;  // Bills and Bonds
-  MARKET_FUT = 3;  // Futures
-  MARKET_ODL = 4;  // Odd Lot
-  MARKET_SQR = 5;  // Square-up
-  MARKET_FSR = 6;  // Futures Square-up
-  MARKET_NDM = 7;  // Negotiated Deal Market
-  MARKET_SIF = 8;  // Stock Index Futures
-  MARKET_IOM = 9;  // Index Options Market
-  MARKET_SOM = 10; // Stock Options Market
+  MARKET_REG = 1;
+  MARKET_BNB = 2;
+  MARKET_FUT = 3;
+  MARKET_ODL = 4;
+  MARKET_SQR = 5;
+  MARKET_FSR = 6;
+  MARKET_NDM = 7;
+  MARKET_SIF = 8;
+  MARKET_IOM = 9;
+  MARKET_SOM = 10;
+  // Indices. Quote-only — indices have no order book and are never tradeable.
+  MARKET_IDX = 11;
+  MARKET_CSF = 12;
+  MARKET_TRM = 13;
 }
 
 enum OrderType {
@@ -348,4 +382,207 @@ message TradingSessionStatus {
   Market market = 2;
   SessionStatus status = 3;
   google.protobuf.Timestamp timestamp = 4;
+}
+
+// ===========================================================================
+// Market data — quotes and order book
+// ===========================================================================
+//
+// Unlike executions and session status, market data is not pushed from connect:
+// it is per-symbol and high-volume, so a client names the symbols it wants.
+// Both streams are snapshot-based — every QuoteUpdate and OrderBookUpdate
+// carries the symbol's full state rather than a delta against the last one, so
+// a client that misses a frame loses nothing the next frame will not carry.
+//
+// Concurrent subscriptions are capped per connection by the plan's
+// `quote_subscriptions` and `orderbook_subscriptions` quotas, reported in
+// Welcome.quotas.
+
+// A symbol within a market — how subscriptions are named in both directions.
+message SymbolRef {
+  Market market = 1;
+  string symbol = 2;
+}
+
+// Why one symbol of a subscribe request was refused. The rest of the request
+// still applies: subscriptions are resolved per symbol, never all-or-nothing.
+enum SubscriptionRejectReason {
+  SUBSCRIPTION_REJECT_REASON_UNSPECIFIED = 0;
+  // The plan's concurrent-subscription cap is already spent.
+  SUBSCRIPTION_REJECT_REASON_QUOTA_EXCEEDED = 1;
+  // market is UNSPECIFIED, or symbol is empty or too long.
+  SUBSCRIPTION_REJECT_REASON_INVALID_SYMBOL = 2;
+  // The market publishes nothing on this stream — indices have no order book.
+  SUBSCRIPTION_REJECT_REASON_UNSUPPORTED_MARKET = 3;
+}
+
+message SubscriptionRejection {
+  SymbolRef symbol = 1;
+  SubscriptionRejectReason reason = 2;
+}
+
+// Answers all four subscribe/unsubscribe commands.
+//
+// `accepted` holds the symbols now subscribed (on unsubscribe, the ones
+// removed). Subscribing to a symbol already subscribed is accepted and consumes
+// no further allowance; unsubscribing one that was never subscribed is simply
+// absent from `accepted`. `active` is the connection's subscription count for
+// this stream after the change, and `limit` the plan's cap on it (-1 unlimited).
+message SubscriptionResponse {
+  repeated SymbolRef accepted = 1;
+  repeated SubscriptionRejection rejected = 2;
+  int32 active = 3;
+  int32 limit = 4;
+}
+
+// Starts quote updates. The latest known quote for each accepted symbol is
+// pushed immediately, so a client sees data without waiting for the market to
+// move — or, outside session hours, at all.
+message SubscribeQuotesRequest {
+  repeated SymbolRef symbols = 1;
+}
+
+// Stops quote updates. An empty `symbols` list drops every quote subscription
+// on the connection.
+message UnsubscribeQuotesRequest {
+  repeated SymbolRef symbols = 1;
+}
+
+// Starts order-book updates, with the latest known book pushed immediately.
+// Indices are rejected: they have no order book.
+message SubscribeOrderBookRequest {
+  repeated SymbolRef symbols = 1;
+}
+
+// Stops order-book updates. An empty `symbols` list drops every order-book
+// subscription on the connection.
+message UnsubscribeOrderBookRequest {
+  repeated SymbolRef symbols = 1;
+}
+
+// A full quote snapshot for one symbol.
+message QuoteUpdate {
+  Market market = 1;
+  string symbol = 2;
+  SessionStatus state = 3;
+  google.protobuf.Timestamp timestamp = 4;
+  double open = 5;
+  double high = 6;
+  double low = 7;
+  double close = 8;
+  int64 volume = 9;
+  // Last day's closing price (LDCP), the reference `change` is measured from.
+  double last_day_close = 10;
+  double change = 11;
+  double change_percent = 12;
+  double bid_price = 13;
+  int64 bid_quantity = 14;
+  double ask_price = 15;
+  int64 ask_quantity = 16;
+  // Traded value for the day, in currency rather than shares.
+  double value = 17;
+  int64 trades = 18;
+  // Absent when the symbol has not traded yet.
+  LastTrade last_trade = 19;
+}
+
+message LastTrade {
+  google.protobuf.Timestamp timestamp = 1;
+  double price = 2;
+  int64 quantity = 3;
+}
+
+// A full order-book snapshot for one symbol.
+message OrderBookUpdate {
+  Market market = 1;
+  string symbol = 2;
+  google.protobuf.Timestamp timestamp = 3;
+  OrderBookSide buy = 4;
+  OrderBookSide sell = 5;
+}
+
+// One side of the book: the visible price levels, plus statistics covering the
+// whole side including the levels beyond those listed.
+message OrderBookSide {
+  double weighted_avg_price = 1;
+  double total_quantity = 2;
+  // Best price first (level 1). The exchange publishes up to 10.
+  repeated OrderBookLevel levels = 3;
+}
+
+message OrderBookLevel {
+  int32 level = 1;
+  double price = 2;
+  int64 quantity = 3;
+  // How many separate orders rest at this price.
+  int64 order_count = 4;
+}
+
+// ===========================================================================
+// Market data — historical
+// ===========================================================================
+//
+// Historical data for one symbol over a time range. Unlike quotes and the order
+// book, this is a request/response command rather than a subscription: history
+// does not change, so there is nothing to stream.
+//
+// Which intervals a session may ask for, and how far back, are capped by the
+// plan's `historical_data_intervals` and `historical_data_days` quotas, both
+// reported in Welcome.quotas. `historical_data_days` counts *trading* days, so
+// a seven-day plan reaches seven sessions back however many weekends and market
+// holidays lie between them. History is entitled by plan alone, like the live
+// feed — any symbol the market publishes is readable by any entitled session.
+
+// Asks for one symbol's historical data between two instants.
+//
+// `interval` is one of the codes in `Welcome.quotas.historical_data_intervals`.
+// Both bounds are required, and how wide a range one request may cover depends
+// on the interval: a daily request may span 90 days.
+//
+// Reaching further back than the plan covers is not an error. The range is
+// trimmed to the plan's last `historical_data_days` sessions and served, and
+// the result reports what it was trimmed to.
+//
+// `market` is required, though history is keyed by symbol alone today. It is
+// carried so a client names an instrument the same way here as it does in a
+// subscription, and so the surface is already right if history ever becomes
+// per-market.
+message GetHistoricalRequest {
+  Market market = 1;
+  string symbol = 2;
+  string interval = 3;
+  google.protobuf.Timestamp time_from = 4;
+  google.protobuf.Timestamp time_to = 5;
+}
+
+// `market`, `symbol` and `interval` echo the request, so a client holding
+// several charts can route a result without tracking request_ids itself. Data
+// is ordered oldest first, and a range the symbol never traded in comes back
+// empty rather than as an error.
+//
+// `time_from` and `time_to` are the range actually served. `time_from` is later
+// than the one asked for when the request reached further back than the plan's
+// `historical_data_days` sessions cover: the range is trimmed to what the plan
+// allows rather than refused, and this is where a client sees that happen. A
+// client charting further back pages by asking again with an earlier range.
+message GetHistoricalResponse {
+  Market market = 1;
+  string symbol = 2;
+  string interval = 3;
+  repeated HistoricalData data = 4;
+  google.protobuf.Timestamp time_from = 5;
+  google.protobuf.Timestamp time_to = 6;
+}
+
+// One interval of trading, as a candle.
+//
+// `timestamp` is where the interval *closes* — the last trade counted into it —
+// so a daily point is stamped at the session's close rather than its open.
+message HistoricalData {
+  google.protobuf.Timestamp timestamp = 1;
+  double open = 2;
+  double high = 3;
+  double low = 4;
+  double close = 5;
+  int64 volume = 6;
 }

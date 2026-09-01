@@ -14,7 +14,9 @@ Connect to the StockIntel Trading API in three steps: get your tokens, compile t
 
 ## 2. Generate API Tokens
 
-> **Eligibility:** API tokens (both sandbox and live) are only available to users who have opened a brokerage account with one of the available brokers through StockIntel. If you have not yet opened a brokerage account, do so first — the **API Tokens** section will not issue keys until an account is linked.
+> **Eligibility:** API tokens (both sandbox and live) are only available to users who have opened a brokerage account with one of the available brokers through StockIntel. If you have not yet opened a brokerage account, do so first — the **API Tokens** section will not issue keys until an account is linked. An account connected from an outside broker does not qualify: connecting with such a token is refused at the handshake with `403 not_eligible`.
+>
+> **An active plan is also required.** Your plan sets your API limits, and a lapsed subscription is refused at the handshake with `403 invalid_plan`. Sandbox access itself is a plan entitlement: on a plan without it, generating a sandbox token fails with `sandbox_not_allowed`. See [Plan Quotas](./api-reference.md#plan-quotas).
 
 Tokens are issued from your StockIntel account dashboard:
 
@@ -209,22 +211,40 @@ ws.on('message', (data) => {
 
 Immediately after the WebSocket upgrade succeeds, the server pushes a **`Welcome` frame** telling you your environment (`"sandbox"` or `"live"`), the server's heartbeat interval, and your linked trading accounts.
 
-**If you connected with a live token and OTP is required:**
+**If OTP is required:**
 
-- `Welcome.otp_required` is `true` and `Welcome.accounts` is empty.
-- If `Welcome.has_email` is `true`, the server emailed you a 5-digit code. Send it back with `SubmitOtp` before any trading commands.
-- If `Welcome.has_email` is `false`, no email is configured for your account. Add an email in your **StockIntel settings**, then reconnect.
+- `Welcome.otp_required` is `true`, `Welcome.accounts` is empty and `Welcome.quotas` is absent.
+- **Live token:** if `Welcome.has_email` is `true`, the server emailed you a 5-digit code — send it back with `SubmitOtp` before any trading command. If it is `false`, no email is configured for your account: add one in your **StockIntel settings**, then reconnect.
+- **Sandbox token:** the code is always **`54321`**. Nothing is emailed. Sandbox runs the same gate as live so you only ever write one connect flow; the code is published, not secret.
 - All trading/account commands return `ERROR_CODE_OTP_REQUIRED` until OTP succeeds.
-- After successful `SubmitOtp`, the server replies with `SubmitOtpResponse` carrying your unlocked accounts.
+- After successful `SubmitOtp`, the server replies with `SubmitOtpResponse` carrying your unlocked accounts and your quotas.
 
-**Sandbox tokens are never OTP-gated** — `Welcome.otp_required` is always `false`, accounts are populated immediately, and you can start sending commands right away.
+`Welcome.otp_message` always says which of these applies in plain language — display it to your user rather than writing your own copy.
 
-Once the session is unlocked (or OTP is not required):
+Once the session is unlocked (or OTP was not required):
 
 1. **Accounts are available** — listed in `Welcome.accounts` or `SubmitOtpResponse.accounts`.
-2. **Real-time data begins** — `ExecutionEvent` and `TradingSessionStatus` frames start arriving automatically. No subscribe step required.
+2. **Your plan's limits are available** — in `Welcome.quotas` or `SubmitOtpResponse.quotas`: how many orders a day you may place, how many other commands a minute, which order types your plan includes, how many symbols you may subscribe to at once, and how far back your history reaches. See [API Reference — Plan Quotas](./api-reference.md#plan-quotas).
+3. **Real-time data begins** — `ExecutionEvent` and `TradingSessionStatus` frames start arriving automatically. No subscribe step required.
 
 You can now send commands: place orders, cancel orders, fetch account balances, query order history, or check market session status. See the [API Reference](./api-reference.md) for the full operation catalog.
+
+### Market data is opt-in
+
+Quotes and order books are the one thing that does **not** start automatically. They are per-symbol and high-volume, so you name the symbols you want:
+
+```python
+cmd = capri_pb2.ClientFrame()
+cmd.request_id = str(uuid.uuid4())
+ref = cmd.subscribe_quotes.symbols.add()
+ref.market = capri_pb2.MARKET_REG
+ref.symbol = "PSO"
+await ws.send(cmd.SerializeToString())
+```
+
+The server answers with a `SubscriptionResponse` and pushes the latest snapshot straight away, so you see data without waiting for the market to move. Check its `rejected` list — symbols past your plan's cap are refused individually while the rest take effect.
+
+Historical candles are a plain request/response: send `GetHistoricalRequest` with a market, symbol, interval, and both ends of the range. See [API Reference — Market Data](./api-reference.md#market-data) and [Historical Data](./api-reference.md#historical-data).
 
 ---
 
@@ -254,13 +274,14 @@ Use these scenarios to test your order lifecycle handling, error recovery, and c
 
 ## 7. Connection Lifecycle
 
-**Sandbox / live token within OTP window:**
+**Token within its OTP window (verified in the last 7 days):**
 
 ```
   Client                         StockIntel API
     │                                    │
     │── WSS Upgrade + Auth ─────────────▶│
-    │◀──────── 101 + Welcome ────────────│  (otp_required:false; real-time pushes start)
+    │◀──────── 101 + Welcome ────────────│  (otp_required:false, accounts, quotas;
+    │                                    │   real-time pushes start)
     │                                    │
     │── ClientFrame { PlaceOrder } ─────▶│
     │◀── ServerFrame { PlaceOrder {} } ──│  (immediate empty ack)
@@ -272,7 +293,7 @@ Use these scenarios to test your order lifecycle handling, error recovery, and c
     │── close ──────────────────────────▶│ (or keepalive ping/pong)
 ```
 
-**Live token outside OTP window (first connect or 7-day window expired):**
+**Token outside its OTP window (first connect, or 7 days elapsed) — either environment:**
 
 ```
   Client                         StockIntel API
@@ -280,9 +301,10 @@ Use these scenarios to test your order lifecycle handling, error recovery, and c
     │── WSS Upgrade + Auth ─────────────▶│
     │◀──────── 101 + Welcome ────────────│  (otp_required:true, accounts:[], otp_message)
     │                                    │
-    │   [user checks email for code]     │
+    │   [live: user checks email]        │
+    │   [sandbox: the code is 54321]     │
     │── ClientFrame { SubmitOtp } ──────▶│
-    │◀── ServerFrame { SubmitOtpResponse }│  (accounts now populated)
+    │◀── ServerFrame { SubmitOtpResponse }│  (accounts and quotas now populated)
     │                                    │   (real-time pushes start after unlock)
     │── ClientFrame { PlaceOrder } ─────▶│
     │◀── ServerFrame { PlaceOrder {} } ──│  (immediate empty ack)
